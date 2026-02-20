@@ -62,22 +62,8 @@ async def lifespan(app: FastAPI):
         else:
             print("⚠️  SQLITE_VOLUME_BACKUP_PATH not configured - database will NOT persist across container restarts")
 
-    # NOTE: This is a *fallback* safety net for deployments that don't run `just db-bootstrap`.
-    # It is designed to be safe under multi-process servers (e.g., gunicorn with multiple
-    # Uvicorn workers) via an inter-process lock.
-    maybe_bootstrap_db_on_startup()
-
-    # Safety net: ensure tables exist even if Alembic bootstrap failed/skipped.
-    # For SQLite the .db file may exist but be empty; for PG the schema may be missing.
-    from server.database import Base, engine
-    try:
-        Base.metadata.create_all(bind=engine, checkfirst=True)
-        print("✅ Database tables verified/created via SQLAlchemy metadata")
-    except Exception as e:
-        print(f"⚠️  Table creation safety net failed (non-fatal): {e}")
-
-    # For PostgreSQL/Lakebase: ensure schema and tables exist.
-    # Lakebase requires tables in a schema owned by the service principal.
+    # For PostgreSQL/Lakebase: create the schema BEFORE any table creation
+    # so that the search_path resolves correctly.
     if db_backend == DatabaseBackend.POSTGRESQL:
         from sqlalchemy import text
 
@@ -88,51 +74,76 @@ async def lifespan(app: FastAPI):
         schema_name = lakebase_cfg.app_name.replace("-", "_") if lakebase_cfg else "human_eval_workshop"
         pg_user = os.getenv("PGUSER", "")
 
+        # Step 1: Create the schema first (must happen before table creation)
         try:
             with engine.connect() as conn:
-                # Create the schema owned by the service principal
                 conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema_name}" AUTHORIZATION "{pg_user}"'))
-                # Grant privileges on the schema to PGUSER
                 if pg_user:
                     conn.execute(text(f'GRANT ALL PRIVILEGES ON SCHEMA "{schema_name}" TO "{pg_user}"'))
                 conn.commit()
-                print(f"✅ PostgreSQL schema '{schema_name}' ensured")
+                print(f"PostgreSQL schema '{schema_name}' ensured")
         except Exception as e:
-            print(f"⚠️  PostgreSQL schema creation failed: {e}")
+            print(f"PostgreSQL schema creation failed: {e}")
             import traceback
             traceback.print_exc()
 
+        # Step 2: Use PostgresManager to create tables with explicit DDL.
+        # This is more reliable than SQLAlchemy create_all because it uses
+        # the connection pool with search_path already set to the correct schema.
         try:
-            # Create tables — search_path is set via connect_args options in
-            # create_engine_for_backend, so tables land in the app schema.
-            Base.metadata.create_all(bind=engine, checkfirst=True)
-            print("✅ PostgreSQL tables verified/created via SQLAlchemy metadata")
+            from server.postgres_manager import PostgresManager
+            pg_mgr = PostgresManager.get_instance()
+            pg_mgr.create_tables()
+            print("PostgreSQL tables created via PostgresManager DDL")
         except Exception as e:
-            print(f"⚠️  PostgreSQL table creation failed: {e}")
+            print(f"PostgresManager table creation failed: {e}")
             import traceback
             traceback.print_exc()
 
-        # Grant privileges on all tables in the schema to PGUSER
+        # Step 3: Also run SQLAlchemy create_all as a fallback for any
+        # tables/columns defined in ORM models but missing from DDL.
+        try:
+            Base.metadata.create_all(bind=engine, checkfirst=True)
+            print("PostgreSQL tables verified via SQLAlchemy metadata")
+        except Exception as e:
+            print(f"SQLAlchemy table creation fallback failed (non-fatal): {e}")
+
+        # Step 4: Grant privileges on all tables in the schema
         try:
             if pg_user:
                 with engine.connect() as conn:
                     conn.execute(text(f'GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA "{schema_name}" TO "{pg_user}"'))
                     conn.execute(text(f'GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA "{schema_name}" TO "{pg_user}"'))
                     conn.commit()
-                    print(f"✅ PostgreSQL privileges granted to '{pg_user}' on schema '{schema_name}'")
+                    print(f"PostgreSQL privileges granted to '{pg_user}' on schema '{schema_name}'")
         except Exception as e:
-            print(f"ℹ️  PostgreSQL privilege grant skipped: {e}")
+            print(f"PostgreSQL privilege grant skipped: {e}")
 
         try:
-            # Fix: make users.workshop_id nullable (facilitators don't have a workshop)
-            # This is needed for existing tables created with NOT NULL constraint
             with engine.connect() as conn:
                 conn.execute(text("ALTER TABLE users ALTER COLUMN workshop_id DROP NOT NULL"))
                 conn.commit()
-                print("✅ PostgreSQL users.workshop_id made nullable")
+                print("PostgreSQL users.workshop_id made nullable")
         except Exception as e:
-            # Non-critical — column may already be nullable
-            print(f"ℹ️  users.workshop_id nullable fix skipped: {e}")
+            print(f"users.workshop_id nullable fix skipped: {e}")
+
+    else:
+        # SQLite path: restore from volume, then bootstrap
+        pass
+
+    # NOTE: This is a *fallback* safety net for deployments that don't run `just db-bootstrap`.
+    # It is designed to be safe under multi-process servers (e.g., gunicorn with multiple
+    # Uvicorn workers) via an inter-process lock.
+    maybe_bootstrap_db_on_startup()
+
+    # Safety net: ensure tables exist even if Alembic bootstrap failed/skipped.
+    # For SQLite the .db file may exist but be empty; for PG the schema may be missing.
+    from server.database import Base, engine
+    try:
+        Base.metadata.create_all(bind=engine, checkfirst=True)
+        print("Database tables verified/created via SQLAlchemy metadata")
+    except Exception as e:
+        print(f"Table creation safety net failed (non-fatal): {e}")
 
     print("✅ Application startup complete!")
     yield

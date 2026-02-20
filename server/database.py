@@ -158,6 +158,7 @@ class WorkshopDB(Base):
     auto_evaluation_prompt = Column(Text, nullable=True)  # Derived judge prompt used for auto-evaluation
     auto_evaluation_model = Column(String, nullable=True)  # Model used for auto-evaluation
     show_participant_notes = Column(Boolean, default=False)  # Facilitator toggle: show notepad to SMEs
+    skills_generation_job_id = Column(String, nullable=True)  # Job ID for latest skills generation run
     created_at = Column(DateTime, default=func.now())
 
     # Relationships
@@ -452,6 +453,30 @@ class PromptOptimizationRunDB(Base):
     metrics = Column(Text, nullable=True)  # JSON string
     status = Column(String, default="pending")  # pending, running, completed, failed
     error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Relationships
+    workshop = relationship("WorkshopDB")
+
+
+class GeneratedSkillDB(Base):
+    """Database model for agent skills generated from workshop artifacts.
+
+    Skills are synthesized from the optimized prompt, aligned judge memory,
+    and evaluated traces, then stored in Lakebase for workshop participants
+    to integrate into their agents independently.
+    """
+
+    __tablename__ = "generated_skills"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    workshop_id = Column(String, ForeignKey("workshops.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    filename = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    generation_model = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

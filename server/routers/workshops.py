@@ -156,6 +156,7 @@ from server.models import (
     RubricCreate,
     RubricGenerationRequest,
     RubricSuggestion,
+    SkillsGenerationRequest,
     Trace,
     TraceUpload,
     Workshop,
@@ -4907,7 +4908,7 @@ async def re_evaluate(
                     mlflow_config=mlflow_config,
                     judge_type=judge_type,
                     require_human_ratings=False,  # Don't require human ratings - just run evaluation
-                    tag_type='eval',  # Use 'eval' tag for evaluation traces
+                    tag_type='align',  # Use 'align' tag: human annotation overwrites 'eval' with 'align'
                     use_registered_judge=False,  # Use the prompt directly, not the aligned judge
                 ):
                     if isinstance(message, dict):
@@ -5401,7 +5402,6 @@ async def start_prompt_optimization_job(
                 if result and result.get("success"):
                     job.result = result
                     job.save()
-                    job.set_status("completed")
                     job.add_log("Prompt optimization completed successfully")
 
                     # Update DB record
@@ -5423,6 +5423,8 @@ async def start_prompt_optimization_job(
                             _update_db.close()
                         except Exception as db_err:
                             logger.warning("Failed to update optimization run record: %s", db_err)
+
+                    job.set_status("completed")
                 else:
                     job.set_status("failed")
                     job.error = result.get("error", "Unknown error") if result else "No result returned"
@@ -5584,3 +5586,304 @@ async def get_prompt_optimization_history(
         }
         for run in runs
     ]
+
+
+# ============================================================================
+# Generated Skills Endpoints
+# ============================================================================
+
+
+@router.post("/{workshop_id}/start-skills-generation")
+async def start_skills_generation_job(
+    workshop_id: str,
+    request: SkillsGenerationRequest,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Start an agent skills generation job in the background.
+
+    Skills are synthesized from three sources:
+    1. System prompt (optimized or current)
+    2. Aligned judge memory (semantic + episodic)
+    3. Evaluated traces with feedback
+
+    Use GET /skills-generation-job/{job_id} to poll for status and logs.
+    """
+    from server.services.skills_generation_service import SkillsGenerationService
+
+    logger.info("=== START SKILLS GENERATION JOB ===")
+    logger.info("workshop_id=%s", workshop_id)
+
+    db_service = DatabaseService(db)
+    workshop = db_service.get_workshop(workshop_id)
+    if not workshop:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+
+    # Get MLflow config
+    mlflow_config = db_service.get_mlflow_config(workshop_id)
+    if not mlflow_config:
+        raise HTTPException(status_code=400, detail="MLflow configuration not found")
+
+    # Get Databricks token
+    from server.services.token_storage_service import token_storage
+
+    databricks_token = token_storage.get_token(workshop_id)
+    if not databricks_token:
+        databricks_token = db_service.get_databricks_token(workshop_id)
+        if databricks_token:
+            token_storage.store_token(workshop_id, databricks_token)
+    if not databricks_token:
+        raise HTTPException(status_code=400, detail="Databricks token not found")
+
+    mlflow_config.databricks_token = databricks_token
+
+    # Determine prompt to use
+    prompt_text = request.prompt_text
+    prompt_source = "user-provided"
+    if not prompt_text:
+        # Try to get optimized prompt from most recent run
+        from server.database import PromptOptimizationRunDB
+
+        recent_run = (
+            db.query(PromptOptimizationRunDB)
+            .filter(
+                PromptOptimizationRunDB.workshop_id == workshop_id,
+                PromptOptimizationRunDB.status == "completed",
+            )
+            .order_by(PromptOptimizationRunDB.created_at.desc())
+            .first()
+        )
+
+        if recent_run and recent_run.optimized_prompt:
+            prompt_text = recent_run.optimized_prompt
+            prompt_source = "optimized (from GEPA)"
+            logger.info("Using optimized prompt from run %s", recent_run.id)
+        else:
+            # Fall back to current workshop prompt
+            prompt_records = db_service.get_judge_prompts(workshop_id)
+            if prompt_records:
+                prompt_text = prompt_records[0].prompt_text
+                prompt_source = "workshop judge prompt (no optimization run found)"
+                logger.info("Using current workshop prompt")
+            else:
+                logger.warning("No prompt found - skills will be generated without prompt context")
+                prompt_text = ""
+                prompt_source = "none"
+
+    # Determine judge name(s) — load all aligned judges from rubric questions
+    judge_name = request.judge_name or workshop.judge_name or "workshop_judge"
+    rubric_questions = db_service.get_rubric_questions_for_evaluation(workshop_id)
+    judge_names = [q['judge_name'] for q in rubric_questions] if rubric_questions else []
+    if judge_names:
+        logger.info("Found %d rubric judges for skills generation: %s", len(judge_names), judge_names)
+    else:
+        logger.info("No rubric judges found, falling back to single judge: %s", judge_name)
+
+    # Create job
+    job_id = str(uuid.uuid4())
+    job = create_job(job_id, workshop_id)
+    job.set_status("running")
+    job.add_log("Skills generation job started")
+    job.add_log(f"Prompt source: {prompt_source}")
+
+    # Persist skills_generation_job_id on the workshop so the frontend can
+    # recover it after tab switches or page reloads.
+    from server.database import WorkshopDB
+    db_workshop = db.query(WorkshopDB).filter(WorkshopDB.id == workshop_id).first()
+    if db_workshop:
+        db_workshop.skills_generation_job_id = job_id
+        db.commit()
+
+    # Start background thread
+    def run_skills_generation():
+        try:
+            skills_service = SkillsGenerationService()
+            skills_result = None
+            for skills_msg in skills_service.generate_skills(
+                workshop_id=workshop_id,
+                optimized_prompt=prompt_text,
+                model_name=request.generation_model_name,
+                mlflow_config=mlflow_config,
+                judge_names=judge_names,
+                judge_name=judge_name,
+            ):
+                if isinstance(skills_msg, dict):
+                    skills_result = skills_msg
+                    if skills_result.get("success"):
+                        job.result = {
+                            "success": True,
+                            "skills": skills_result.get("skills", []),
+                            "skills_count": skills_result.get("skills_count", 0),
+                        }
+                        job.save()
+                elif isinstance(skills_msg, str):
+                    job.add_log(skills_msg)
+
+            if skills_result and skills_result.get("success"):
+                job.add_log(f"Skills generation complete: {skills_result.get('skills_count', 0)} skills")
+                job.set_status("completed")
+            elif skills_result:
+                job.set_status("failed")
+                job.error = skills_result.get('error', 'Unknown error')
+                job.add_log(f"Skills generation failed: {job.error}")
+            else:
+                job.set_status("failed")
+                job.error = "No result returned"
+                job.add_log("Skills generation returned no result")
+
+        except Exception as e:
+            logger.exception("Skills generation job failed")
+            job.set_status("failed")
+            job.error = str(e)
+            job.add_log(f"ERROR: {e}")
+
+    import threading
+    thread = threading.Thread(target=run_skills_generation, daemon=True)
+    thread.start()
+
+    return {
+        "job_id": job_id,
+        "status": "running",
+        "message": "Skills generation started. Poll GET /skills-generation-job/{job_id} for status.",
+    }
+
+
+@router.get("/{workshop_id}/skills-generation-job/{job_id}")
+async def get_skills_generation_job_status(
+    workshop_id: str,
+    job_id: str,
+    since_log_index: int = 0,
+) -> Dict[str, Any]:
+    """Get the status and logs of a skills generation job.
+
+    Use `since_log_index` to get only new logs since the last poll.
+    """
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Skills generation job not found")
+
+    if job.workshop_id != workshop_id:
+        raise HTTPException(status_code=403, detail="Job does not belong to this workshop")
+
+    new_logs = job.logs[since_log_index:] if since_log_index > 0 else job.logs
+
+    response = {
+        "job_id": job_id,
+        "status": job.status,
+        "logs": new_logs,
+        "log_count": len(job.logs),
+        "updated_at": job.updated_at,
+    }
+
+    if job.result:
+        response["result"] = job.result
+    if job.error:
+        response["error"] = job.error
+
+    return response
+
+
+@router.get("/{workshop_id}/latest-skills-generation-job")
+async def get_latest_skills_generation_job(
+    workshop_id: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Get the latest skills generation job for a workshop.
+
+    Returns the stored job_id and its current status/logs so the frontend
+    can resume polling after a tab switch or page reload.
+    """
+    from server.database import WorkshopDB
+
+    db_workshop = db.query(WorkshopDB).filter(WorkshopDB.id == workshop_id).first()
+    if not db_workshop:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+
+    job_id = getattr(db_workshop, "skills_generation_job_id", None)
+    if not job_id:
+        return {"job_id": None, "status": "none", "logs": [], "log_count": 0}
+
+    job = get_job(job_id)
+    if not job:
+        return {"job_id": job_id, "status": "unknown", "logs": [], "log_count": 0}
+
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "logs": job.logs,
+        "log_count": len(job.logs),
+        "updated_at": job.updated_at,
+        "result": job.result if job.result else None,
+        "error": job.error if job.error else None,
+    }
+
+
+@router.get("/{workshop_id}/generated-skills")
+async def get_generated_skills(
+    workshop_id: str,
+    db: Session = Depends(get_db),
+) -> List[Dict[str, Any]]:
+    """Get all generated agent skills for a workshop.
+
+    Returns skill metadata (name, description, filename) plus full content.
+    """
+    from server.database import GeneratedSkillDB
+
+    db_service = DatabaseService(db)
+    workshop = db_service.get_workshop(workshop_id)
+    if not workshop:
+        raise HTTPException(status_code=404, detail="Workshop not found")
+
+    skills = (
+        db.query(GeneratedSkillDB)
+        .filter(GeneratedSkillDB.workshop_id == workshop_id)
+        .order_by(GeneratedSkillDB.name)
+        .all()
+    )
+
+    return [
+        {
+            "id": skill.id,
+            "name": skill.name,
+            "description": skill.description,
+            "filename": skill.filename,
+            "content": skill.content,
+            "generation_model": skill.generation_model,
+            "created_at": skill.created_at.isoformat() if skill.created_at else None,
+        }
+        for skill in skills
+    ]
+
+
+@router.get("/{workshop_id}/generated-skills/{skill_name}")
+async def get_generated_skill_by_name(
+    workshop_id: str,
+    skill_name: str,
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Get a single generated skill by name.
+
+    Returns full skill content including the markdown body.
+    """
+    from server.database import GeneratedSkillDB
+
+    skill = (
+        db.query(GeneratedSkillDB)
+        .filter(
+            GeneratedSkillDB.workshop_id == workshop_id,
+            GeneratedSkillDB.name == skill_name,
+        )
+        .first()
+    )
+
+    if not skill:
+        raise HTTPException(status_code=404, detail=f"Skill '{skill_name}' not found for this workshop")
+
+    return {
+        "id": skill.id,
+        "name": skill.name,
+        "description": skill.description,
+        "filename": skill.filename,
+        "content": skill.content,
+        "generation_model": skill.generation_model,
+        "created_at": skill.created_at.isoformat() if skill.created_at else None,
+    }

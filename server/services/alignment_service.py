@@ -434,16 +434,14 @@ class AlignmentService:
                     mlflow_to_workshop_trace_map[trace.mlflow_trace_id] = trace.id
             yield f"Built MLflow-to-workshop trace mapping ({len(mlflow_to_workshop_trace_map)} traces)"
         
-        # Set up MLflow environment based on available credentials
+        # Set up MLflow environment.
+        # Prefer the stored user token over the app's service principal
+        # because UC operations require permissions on the facilitator's schemas.
         os.environ['DATABRICKS_HOST'] = mlflow_config.databricks_host.rstrip('/')
-        has_oauth = bool(os.environ.get('DATABRICKS_CLIENT_ID') and os.environ.get('DATABRICKS_CLIENT_SECRET'))
-        if has_oauth:
-            os.environ.pop('DATABRICKS_TOKEN', None)
-        else:
+        if mlflow_config.databricks_token:
             os.environ['DATABRICKS_TOKEN'] = mlflow_config.databricks_token
             os.environ.pop('DATABRICKS_CLIENT_ID', None)
             os.environ.pop('DATABRICKS_CLIENT_SECRET', None)
-        # Set tracking URI
         mlflow.set_tracking_uri('databricks')
         
         # Prepare the evaluation data
@@ -978,12 +976,10 @@ class AlignmentService:
             return
         
         try:
-            # Set up MLflow environment
+            # Set up MLflow environment.
+            # Prefer stored user token over app SP for UC operations.
             os.environ['DATABRICKS_HOST'] = mlflow_config.databricks_host.rstrip('/')
-            has_oauth = bool(os.environ.get('DATABRICKS_CLIENT_ID') and os.environ.get('DATABRICKS_CLIENT_SECRET'))
-            if has_oauth:
-                os.environ.pop('DATABRICKS_TOKEN', None)
-            else:
+            if mlflow_config.databricks_token:
                 os.environ['DATABRICKS_TOKEN'] = mlflow_config.databricks_token
                 os.environ.pop('DATABRICKS_CLIENT_ID', None)
                 os.environ.pop('DATABRICKS_CLIENT_SECRET', None)

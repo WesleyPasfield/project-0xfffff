@@ -56,6 +56,7 @@ Use these exact spec names (case-sensitive):
 | `DISCOVERY_TRACE_ASSIGNMENT_SPEC` | Trace assignment |
 | `JUDGE_EVALUATION_SPEC` | Judge & alignment |
 | `RUBRIC_SPEC` | Rubric management |
+| `SKILLS_GENERATION_SPEC` | Agent skills generation |
 | `UI_COMPONENTS_SPEC` | UI components |
 
 ## Tagging Conventions by Framework

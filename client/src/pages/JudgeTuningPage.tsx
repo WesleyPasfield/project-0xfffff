@@ -2582,34 +2582,7 @@ Think step by step about how well the output addresses the criteria, then provid
               </Button>
             )}
 
-            {/* Re-evaluate button - only show after alignment has run */}
-            {evaluationMode === 'mlflow' && alignmentResult && (
-              <Button
-                onClick={handleReEvaluate}
-                disabled={
-                  isRunningEvaluation ||
-                  isRunningAlignment ||
-                  isPollingAutoEval ||
-                  autoEvalStatus === 'running'
-                }
-                variant="outline"
-                className="border-purple-300 text-purple-700 hover:bg-purple-50"
-              >
-                {isRunningEvaluation ? (
-                  <>
-                    <RefreshCw className="h-4 w-4 mr-2 animate-spin" />
-                    Re-evaluating...
-                  </>
-                ) : (
-                  <>
-                    <RefreshCw className="h-4 w-4 mr-2" />
-                    Re-evaluate
-                  </>
-                )}
-              </Button>
-            )}
-
-            {/* Run Evaluation button - runs evaluation for current judge/prompt */}
+            {/* Run Evaluation button - evaluates traces with current judge prompt */}
             {evaluationMode === 'mlflow' && (
               <Button
                 onClick={handleRunCurrentEvaluation}
@@ -2624,7 +2597,7 @@ Think step by step about how well the output addresses the criteria, then provid
                 variant="outline"
                 className="border-green-400 text-green-700 hover:bg-green-50"
               >
-                {isRunningAllEvaluations || (isPollingAutoEval && autoEvalStatus === 'running') ? (
+                {isRunningAllEvaluations || isRunningEvaluation || (isPollingAutoEval && autoEvalStatus === 'running') ? (
                   <>
                     <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                     Evaluating...

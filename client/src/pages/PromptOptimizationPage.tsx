@@ -22,6 +22,7 @@ import {
   Link,
   Zap,
   Download,
+  BookOpen,
 } from 'lucide-react';
 import { useWorkshopContext } from '@/context/WorkshopContext';
 import { useUser, useRoleCheck } from '@/context/UserContext';
@@ -82,6 +83,17 @@ export function PromptOptimizationPage() {
   // MLflow config check
   const [hasMlflowConfig, setHasMlflowConfig] = useState(false);
 
+  // Generated skills state
+  const [generatedSkills, setGeneratedSkills] = useState<any[]>([]);
+  const [expandedSkill, setExpandedSkill] = useState<string | null>(null);
+
+  // Skills generation job state
+  const [skillsJobId, setSkillsJobId] = useState<string | null>(null);
+  const [skillsJobStatus, setSkillsJobStatus] = useState<string | null>(null);
+  const [skillsJobLogs, setSkillsJobLogs] = useState<string[]>([]);
+  const [isGeneratingSkills, setIsGeneratingSkills] = useState(false);
+  const skillsLogIndexRef = useRef(0);
+
   // Auto-scroll logs to bottom when new logs arrive
   useEffect(() => {
     if (logContainerRef.current) {
@@ -117,6 +129,56 @@ export function PromptOptimizationPage() {
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
+
+  // Load generated skills
+  const loadGeneratedSkills = useCallback(async () => {
+    if (!workshopId) return;
+    try {
+      const response = await fetch(`/workshops/${workshopId}/generated-skills`);
+      if (response.ok) {
+        const data = await response.json();
+        setGeneratedSkills(data);
+      }
+    } catch (e) {
+      console.error('Failed to load generated skills:', e);
+    }
+  }, [workshopId]);
+
+  useEffect(() => {
+    loadGeneratedSkills();
+  }, [loadGeneratedSkills]);
+
+  // On mount: recover the latest skills generation job so polling resumes
+  // after tab switches or page reloads.
+  useEffect(() => {
+    if (!workshopId) return;
+    if (skillsJobId) return; // already tracking a job
+
+    (async () => {
+      try {
+        const response = await fetch(`/workshops/${workshopId}/latest-skills-generation-job`);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (!data.job_id || data.status === 'none') return;
+
+        setSkillsJobId(data.job_id);
+        setSkillsJobStatus(data.status);
+        if (data.logs && data.logs.length > 0) {
+          setSkillsJobLogs(data.logs);
+          skillsLogIndexRef.current = data.log_count || data.logs.length;
+        }
+      } catch (e) {
+        console.error('Failed to recover skills generation job:', e);
+      }
+    })();
+  }, [workshopId, skillsJobId]);
+
+  // Reload skills when a job completes (optimization or skills generation)
+  useEffect(() => {
+    if (jobStatus === 'completed' || skillsJobStatus === 'completed') {
+      loadGeneratedSkills();
+    }
+  }, [jobStatus, skillsJobStatus, loadGeneratedSkills]);
 
   // Poll job status
   useEffect(() => {
@@ -221,12 +283,90 @@ export function PromptOptimizationPage() {
     }
   };
 
+  const handleStartSkillsGeneration = async () => {
+    if (!workshopId) return;
+
+    setIsGeneratingSkills(true);
+    setSkillsJobLogs([]);
+    skillsLogIndexRef.current = 0;
+
+    try {
+      const body: Record<string, any> = {
+        generation_model_name: getBackendModelName(optimizerModel),
+        judge_name: workshop?.judge_name || 'workshop_judge',
+      };
+
+      // Only include prompt_text if user has explicitly entered one
+      // Otherwise, backend will auto-select optimized or current prompt
+      if (promptInputMode === 'text' && promptText.trim()) {
+        body.prompt_text = promptText.trim();
+      }
+
+      const response = await fetch(`/workshops/${workshopId}/start-skills-generation`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Failed to start skills generation');
+      }
+
+      const data = await response.json();
+      setSkillsJobId(data.job_id);
+      setSkillsJobStatus('running');
+      toast.success('Skills generation started');
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to start skills generation');
+      setSkillsJobStatus('failed');
+    } finally {
+      setIsGeneratingSkills(false);
+    }
+  };
+
+  // Poll skills generation job
+  useEffect(() => {
+    if (!skillsJobId || !workshopId) return;
+    if (skillsJobStatus === 'completed' || skillsJobStatus === 'failed') return;
+
+    const interval = setInterval(async () => {
+      try {
+        const response = await fetch(
+          `/workshops/${workshopId}/skills-generation-job/${skillsJobId}?since_log_index=${skillsLogIndexRef.current}`
+        );
+        if (!response.ok) return;
+
+        const data = await response.json();
+        setSkillsJobStatus(data.status);
+
+        if (data.logs && data.logs.length > 0) {
+          setSkillsJobLogs((prev) => [...prev, ...data.logs]);
+          skillsLogIndexRef.current = data.log_count;
+        }
+
+        if (data.status === 'completed' && data.result?.success) {
+          toast.success(`Skills generated: ${data.result.skills_count} skills`);
+          // Reload skills list
+          loadGeneratedSkills();
+        } else if (data.status === 'failed') {
+          toast.error(data.error || 'Skills generation failed');
+        }
+      } catch (e) {
+        console.error('Skills poll error:', e);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [skillsJobId, workshopId, skillsJobStatus]);
+
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
     toast.success('Copied to clipboard');
   };
 
   const isRunning = jobStatus === 'running';
+  const isSkillsRunning = skillsJobStatus === 'running';
 
   if (!isFacilitator) {
     return (
@@ -475,6 +615,30 @@ export function PromptOptimizationPage() {
               )}
             </Button>
 
+            <Button
+              onClick={handleStartSkillsGeneration}
+              disabled={isSkillsRunning || isGeneratingSkills}
+              variant="outline"
+              className="border-blue-300 text-blue-700 hover:bg-blue-50"
+            >
+              {isSkillsRunning ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Generating...
+                </>
+              ) : isGeneratingSkills ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Starting...
+                </>
+              ) : (
+                <>
+                  <BookOpen className="h-4 w-4 mr-2" />
+                  Generate Skills
+                </>
+              )}
+            </Button>
+
             {jobStatus && (
               <Badge
                 variant={
@@ -488,6 +652,22 @@ export function PromptOptimizationPage() {
                 {jobStatus === 'failed' && <AlertCircle className="h-3 w-3" />}
                 {jobStatus === 'running' && <Clock className="h-3 w-3" />}
                 {jobStatus}
+              </Badge>
+            )}
+
+            {skillsJobStatus && (
+              <Badge
+                variant={
+                  skillsJobStatus === 'completed' ? 'default' :
+                  skillsJobStatus === 'failed' ? 'destructive' :
+                  'secondary'
+                }
+                className="flex items-center gap-1 bg-blue-100 text-blue-700 border-blue-300"
+              >
+                {skillsJobStatus === 'completed' && <CheckCircle className="h-3 w-3" />}
+                {skillsJobStatus === 'failed' && <AlertCircle className="h-3 w-3" />}
+                {skillsJobStatus === 'running' && <Clock className="h-3 w-3" />}
+                Skills: {skillsJobStatus}
               </Badge>
             )}
           </div>
@@ -576,6 +756,84 @@ export function PromptOptimizationPage() {
               <div className="flex items-center gap-2 mt-2 text-xs text-gray-500">
                 <Loader2 className="h-3 w-3 animate-spin" />
                 <span>{jobLogs.length} log entries | Polling every 2s</span>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* Skills Generation Progress / Logs Card */}
+      {skillsJobLogs.length > 0 && (
+        <Card className="border-blue-200">
+          <CardHeader className="flex flex-row items-center justify-between">
+            <CardTitle className="text-lg flex items-center gap-2">
+              {isSkillsRunning ? (
+                <Loader2 className="h-5 w-5 animate-spin text-blue-600" />
+              ) : skillsJobStatus === 'completed' ? (
+                <CheckCircle className="h-5 w-5 text-green-600" />
+              ) : skillsJobStatus === 'failed' ? (
+                <AlertCircle className="h-5 w-5 text-red-600" />
+              ) : null}
+              Skills Generation Progress
+            </CardTitle>
+            <div className="flex gap-1">
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-gray-500 hover:text-gray-700"
+                onClick={() => copyToClipboard(skillsJobLogs.join('\n'))}
+              >
+                <Copy className="h-3.5 w-3.5 mr-1" />
+                <span className="text-xs">Copy</span>
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-gray-500 hover:text-gray-700"
+                onClick={() => {
+                  const blob = new Blob([skillsJobLogs.join('\n')], { type: 'text/plain' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = `skills-generation-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.log`;
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+              >
+                <Download className="h-3.5 w-3.5 mr-1" />
+                <span className="text-xs">Download</span>
+              </Button>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="bg-gray-950 p-4 rounded overflow-y-auto max-h-96">
+              <pre className="text-sm text-blue-400 font-mono whitespace-pre-wrap">
+                {skillsJobLogs.map((log, i) => (
+                  <div
+                    key={i}
+                    className={`${
+                      log.includes('ERROR') ? 'text-red-400 font-semibold' :
+                      log.includes('WARNING') ? 'text-yellow-400' :
+                      log.includes('======') ? 'text-blue-400 font-semibold' :
+                      log.includes('Source 1:') || log.includes('Source 2:') || log.includes('Source 3:') ? 'text-cyan-400 font-semibold' :
+                      log.includes('Generating skills') || log.includes('Parsing generated skills') ? 'text-amber-400 font-medium' :
+                      log.includes('Writing') && log.includes('skills') ? 'text-green-400 font-medium' :
+                      log.includes('Skills generation complete') || log.includes('complete') ? 'text-green-400 font-semibold' :
+                      log.includes('Validated:') ? 'text-emerald-400' :
+                      log.includes('Extracted') || log.includes('Loading') ? 'text-blue-300' :
+                      log.startsWith('  ') ? 'text-gray-400' :
+                      'text-blue-400'
+                    }`}
+                  >
+                    {log}
+                  </div>
+                ))}
+              </pre>
+            </div>
+            {isSkillsRunning && (
+              <div className="flex items-center gap-2 mt-2 text-xs text-gray-500">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                <span>{skillsJobLogs.length} log entries | Polling every 2s</span>
               </div>
             )}
           </CardContent>
@@ -688,6 +946,118 @@ export function PromptOptimizationPage() {
               </div>
             )}
           </div>
+        </Card>
+      )}
+
+      {/* Generated Skills */}
+      {generatedSkills.length > 0 && (
+        <Card className="border-blue-200">
+          <CardHeader className="pb-3">
+            <div className="flex items-center gap-2">
+              <BookOpen className="h-5 w-5 text-blue-600" />
+              <CardTitle className="text-lg">Generated Agent Skills</CardTitle>
+              <Badge className="bg-blue-100 text-blue-700 border-blue-300 ml-auto">
+                {generatedSkills.length} {generatedSkills.length === 1 ? 'skill' : 'skills'}
+              </Badge>
+            </div>
+            <CardDescription>
+              Skills synthesized from the optimized prompt, aligned judge guidelines, and evaluated traces.
+              Each skill is a self-contained capability description that can be loaded on-demand by an agent.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            {generatedSkills.map((skill) => (
+              <div
+                key={skill.id}
+                className="border border-blue-100 rounded-lg overflow-hidden"
+              >
+                <button
+                  onClick={() => setExpandedSkill(expandedSkill === skill.name ? null : skill.name)}
+                  className="w-full text-left px-4 py-3 hover:bg-blue-50/50 transition-colors flex items-start gap-3"
+                >
+                  <FileText className="h-4 w-4 text-blue-500 mt-0.5 shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium text-sm text-gray-900">{skill.name}</span>
+                      <span className="text-xs text-gray-400 font-mono">{skill.filename}</span>
+                    </div>
+                    <p className="text-xs text-gray-500 mt-0.5 line-clamp-2">{skill.description}</p>
+                  </div>
+                  {expandedSkill === skill.name ? (
+                    <ChevronUp className="h-4 w-4 text-gray-400 shrink-0 mt-0.5" />
+                  ) : (
+                    <ChevronDown className="h-4 w-4 text-gray-400 shrink-0 mt-0.5" />
+                  )}
+                </button>
+                {expandedSkill === skill.name && (
+                  <div className="border-t border-blue-100 bg-blue-50/30 px-4 py-3">
+                    <div className="flex justify-end gap-1 mb-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-gray-500 hover:text-gray-700"
+                        onClick={() => copyToClipboard(skill.content)}
+                      >
+                        <Copy className="h-3.5 w-3.5 mr-1" />
+                        <span className="text-xs">Copy</span>
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 px-2 text-gray-500 hover:text-gray-700"
+                        onClick={() => {
+                          const blob = new Blob([skill.content], { type: 'text/markdown' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = skill.filename;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                          toast.success(`Downloaded ${skill.filename}`);
+                        }}
+                      >
+                        <Download className="h-3.5 w-3.5 mr-1" />
+                        <span className="text-xs">Download</span>
+                      </Button>
+                    </div>
+                    <pre className="p-3 bg-white rounded-lg text-xs overflow-auto max-h-[400px] border border-blue-200 whitespace-pre-wrap font-mono text-gray-700">
+{skill.content}
+                    </pre>
+                    {skill.generation_model && (
+                      <p className="text-xs text-gray-400 mt-2">
+                        Generated with {skill.generation_model}
+                        {skill.created_at && <span> on {new Date(skill.created_at).toLocaleString()}</span>}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+
+            {/* Download all skills */}
+            <div className="pt-2 flex justify-end">
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-blue-600 hover:text-blue-800 border-blue-200"
+                onClick={() => {
+                  generatedSkills.forEach((skill) => {
+                    const blob = new Blob([skill.content], { type: 'text/markdown' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = skill.filename;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  });
+                  toast.success(`Downloaded ${generatedSkills.length} skill files`);
+                }}
+              >
+                <Download className="h-3.5 w-3.5 mr-1" />
+                Download All Skills
+              </Button>
+            </div>
+          </CardContent>
         </Card>
       )}
 

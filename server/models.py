@@ -668,3 +668,11 @@ class PromptOptimizationResult(BaseModel):
   optimized_version: Optional[int] = None
   improvement_summary: Optional[str] = None
   metrics: Optional[Dict[str, Any]] = None
+
+
+class SkillsGenerationRequest(BaseModel):
+  """Request model for starting an agent skills generation job."""
+
+  prompt_text: Optional[str] = Field(default=None, description='Agent system prompt text to use (if not provided, uses optimized or current prompt)')
+  generation_model_name: str = Field(default='databricks-claude-sonnet-4-5', description='Model for skills generation via FMAPI')
+  judge_name: Optional[str] = Field(default=None, description='Aligned judge name to use (defaults to workshop judge)')

@@ -40,7 +40,10 @@ ALLOWED_TABLES: set[str] = {
     "judge_prompts",
     "judge_evaluations",
     "user_trace_orders",
+    "participant_notes",
     "custom_llm_provider_config",
+    "prompt_optimization_runs",
+    "generated_skills",
 }
 
 
@@ -79,6 +82,7 @@ _TABLE_DDL: list[str] = [
         auto_evaluation_job_id      VARCHAR,
         auto_evaluation_prompt      TEXT,
         auto_evaluation_model       VARCHAR,
+        show_participant_notes      BOOLEAN DEFAULT FALSE,
         created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
@@ -257,6 +261,19 @@ _TABLE_DDL: list[str] = [
         updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    # -- participant_notes --
+    """
+    CREATE TABLE IF NOT EXISTS participant_notes (
+        id              VARCHAR PRIMARY KEY,
+        workshop_id     VARCHAR NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+        user_id         VARCHAR NOT NULL REFERENCES users(id),
+        trace_id        VARCHAR REFERENCES traces(id),
+        content         TEXT NOT NULL,
+        phase           VARCHAR DEFAULT 'discovery',
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
     # -- custom_llm_provider_config --
     """
     CREATE TABLE IF NOT EXISTS custom_llm_provider_config (
@@ -270,6 +287,55 @@ _TABLE_DDL: list[str] = [
         updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    # -- prompt_optimization_runs --
+    """
+    CREATE TABLE IF NOT EXISTS prompt_optimization_runs (
+        id              VARCHAR PRIMARY KEY,
+        workshop_id     VARCHAR NOT NULL REFERENCES workshops(id),
+        job_id          VARCHAR NOT NULL,
+        prompt_uri      VARCHAR NOT NULL,
+        original_prompt TEXT,
+        optimized_prompt TEXT,
+        optimized_version INTEGER,
+        optimized_uri   VARCHAR,
+        optimizer_model VARCHAR,
+        num_iterations  INTEGER,
+        num_candidates  INTEGER,
+        metrics         TEXT,
+        status          VARCHAR DEFAULT 'pending',
+        error           TEXT,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    # -- generated_skills --
+    """
+    CREATE TABLE IF NOT EXISTS generated_skills (
+        id              VARCHAR PRIMARY KEY,
+        workshop_id     VARCHAR NOT NULL REFERENCES workshops(id) ON DELETE CASCADE,
+        name            VARCHAR NOT NULL,
+        description     TEXT NOT NULL,
+        filename        VARCHAR NOT NULL,
+        content         TEXT NOT NULL,
+        generation_model VARCHAR,
+        created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE (workshop_id, name)
+    )
+    """,
+]
+
+# ---------------------------------------------------------------------------
+# Column migrations: ADD COLUMN IF NOT EXISTS for columns added after
+# initial table creation. These run after CREATE TABLE IF NOT EXISTS
+# so they safely patch existing tables that were created from older DDL.
+# ---------------------------------------------------------------------------
+_COLUMN_MIGRATIONS: list[str] = [
+    "ALTER TABLE workshops ADD COLUMN IF NOT EXISTS show_participant_notes BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE workshops ADD COLUMN IF NOT EXISTS auto_evaluation_job_id VARCHAR",
+    "ALTER TABLE workshops ADD COLUMN IF NOT EXISTS auto_evaluation_prompt TEXT",
+    "ALTER TABLE workshops ADD COLUMN IF NOT EXISTS auto_evaluation_model VARCHAR",
+    "ALTER TABLE workshops ADD COLUMN IF NOT EXISTS skills_generation_job_id VARCHAR",
 ]
 
 
@@ -400,6 +466,17 @@ class PostgresManager:
             conn.commit()
             logger.info(
                 f"All {len(_TABLE_DDL)} predefined tables created/verified"
+            )
+
+            # Run column migrations to patch existing tables with new columns
+            for migration in _COLUMN_MIGRATIONS:
+                try:
+                    conn.execute(migration)
+                except Exception as col_err:
+                    logger.debug(f"Column migration skipped: {col_err}")
+            conn.commit()
+            logger.info(
+                f"Column migrations applied ({len(_COLUMN_MIGRATIONS)} statements)"
             )
 
             # Grant privileges on all tables and sequences to PGUSER
